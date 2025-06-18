@@ -3,8 +3,9 @@
 domain=$(cat /etc/xray/domain)
 vps_ip=$(curl -s ipv4.icanhazip.com)
 domain_ip=$(ping -c 1 "$domain" | grep PING | awk '{print $3}' | tr -d '()')
-DOMAIN="$domain"  # fix definisi
+DOMAIN="$domain"
 
+# Validasi domain
 if [[ "$domain_ip" != "$vps_ip" ]]; then
     echo -e "\n❌ Domain TIDAK mengarah ke IP VPS ini!"
     echo -e "Domain resolve ke: $domain_ip"
@@ -15,9 +16,24 @@ if [[ "$domain_ip" != "$vps_ip" ]]; then
     exit 1
 fi
 
+# Cek konflik port 80
+if ss -tuln | grep -q ":80"; then
+    echo -e "\n⚠️  Port 80 sedang digunakan oleh service lain!"
+    echo -e "Menonaktifkan socat/nginx untuk sementara..."
+    systemctl stop nginx 2>/dev/null
+    pkill -f "socat.*:80" 2>/dev/null
+    sleep 2
+fi
 
-echo -e "Domain terdeteksi : \e[1;32m$DOMAIN\e[0m"
-echo
+# Cek ulang port 80
+if ss -tuln | grep -q ":80"; then
+    echo -e "\n❌ Port 80 masih digunakan. Tidak bisa melanjutkan SSL issuance."
+    echo -e "Pastikan tidak ada layanan aktif di port 80."
+    read -n 1 -s -r -p "Tekan tombol apapun untuk keluar..."
+    exit 1
+fi
+
+echo -e "\n✅ Domain terdeteksi : \e[1;32m$DOMAIN\e[0m\n"
 echo -e "Pilih penyedia SSL:"
 echo -e "1) Let's Encrypt   [Free, Popular]"
 echo -e "2) ZeroSSL         [Manual Email API]"
@@ -26,10 +42,7 @@ echo -e "4) Google Trust    [Via acme.sh]"
 echo -e "5) Exit"
 echo -ne "\nPilihan [1-5]: "; read ssl_choice
 
-# Hentikan nginx sebelum standalone challenge
-systemctl stop nginx 2>/dev/null
-systemctl stop apache2 2>/dev/null
-
+# Install acme.sh jika belum ada
 if [[ ! -d ~/.acme.sh ]]; then
     echo -e "\n🟡 Menginstall acme.sh..."
     curl https://get.acme.sh | sh
@@ -66,13 +79,15 @@ case $ssl_choice in
         ;;
 esac
 
-# Verifikasi hasil issue
+# Verifikasi sertifikat
 if [[ ! -f ~/.acme.sh/$DOMAIN_ecc/fullchain.cer ]]; then
     echo -e "\n❌ Gagal mendapatkan sertifikat. Cek kembali domain dan port 80."
     systemctl start nginx 2>/dev/null
+    read -n 1 -s -r -p "Tekan tombol apapun untuk kembali..."
     exit 1
 fi
 
+# Instal sertifikat
 echo -e "\n📦 Menginstal sertifikat ke /etc/xray/"
 ~/.acme.sh/acme.sh --install-cert -d $DOMAIN \
 --ecc \
@@ -81,7 +96,14 @@ echo -e "\n📦 Menginstal sertifikat ke /etc/xray/"
 
 echo -e "\n✅ SSL berhasil diinstal!"
 
-# Nyalakan kembali nginx dan xray
+# Restart layanan
 systemctl start nginx 2>/dev/null
-systemctl restart xray
+# 🔁 Restart semua layanan utama setelah SSL terinstal
+echo -e "\n🔁 Merestart semua layanan terkait..."
 
+for svc in ssh sshd dropbear stunnel4 xray squid cron fail2ban vnstat nginx dropbear-ws udp-custom tls-shunt-proxy; do
+    systemctl restart "$svc" 2>/dev/null
+done
+
+echo -e "✅ Semua layanan berhasil direstart!"
+read -n 1 -s -r -p "Tekan tombol apapun untuk kembali..."
